@@ -67,7 +67,6 @@ tmp/
 *.avi
 *.mkv
 *.mov
-*.csv
 *.html
 *.png
 *.jpg
