@@ -71,3 +71,24 @@ tmp/
 *.png
 *.jpg
 *.jpeg 
+
+#arquivos de texto
+*.csv
+*.txt
+*.md
+*.json
+*.yaml
+*.yml
+*.xls
+*.xlsx
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.xlsm
+*.xlsb
+*.xltx
+*.xltm
+*.xlt
+*.xlam
+*.xla

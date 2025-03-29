@@ -22,14 +22,14 @@ def enhance_image_for_ocr(image, roi_type):
     # Converte para escala de cinza
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Aumenta significativamente o fator de escala, especialmente para espaçamento
-    scale = 8 if roi_type == 'spacing' else 7 if roi_type == 'speed' else 6
+    # Aumenta significativamente o fator de escala, especialmente para espaçamento e altura
+    scale = 8 if roi_type in ['spacing', 'height'] else 7 if roi_type == 'speed' else 6
     gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     
     preprocessed_images = []
     
-    # Para espaçamento, aplica técnicas específicas
-    if roi_type == 'spacing':
+    # Para altura e espaçamento, aplica técnicas específicas
+    if roi_type in ['spacing', 'height']:
         # 1. Threshold adaptativo com kernel maior
         norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
         adaptive1 = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5)
