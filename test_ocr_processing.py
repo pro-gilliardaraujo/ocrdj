@@ -102,8 +102,15 @@ def extract_value_from_image(roi_img, roi_type):
                     value = float(text)
                     
                     # Ajusta valores muito grandes
-                    if value > 100:
-                        value = value / 100
+                    if '.' not in text:  # Se não tem ponto decimal
+                        if roi_type == 'height':
+                            # Para altura, se o valor for maior que 20, divide por 10
+                            if value > 20:
+                                value = value / 10
+                        elif value > 100:
+                            value = value / 100
+                        elif value > 10:
+                            value = value / 10
                     
                     # Verifica se o valor está dentro dos limites esperados
                     is_valid = False
@@ -498,131 +505,15 @@ def adjust_spacing_roi(rois):
         print(f"Nova largura: {rois['spacing']['width']:.3f}\n")
     return rois
 
-def test_roi_extraction(video_path, rois, base_output_dir):
-    """
-    Função principal de teste que processa o vídeo e extrai os valores das ROIs
-    """
-    # Abre o vídeo
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Erro ao abrir o vídeo: {video_path}")
-        return None
-    
-    # Obtém informações do vídeo
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
-    
-    print(f"\n{'='*50}")
-    print(f"Processando vídeo: {video_name}")
-    print(f"FPS: {fps}")
-    print(f"Total de frames: {total_frames}")
-    print(f"Duração aproximada: {total_frames/fps:.2f} segundos")
-    print(f"{'='*50}\n")
-    
-    # Cria diretório para os resultados deste vídeo
-    video_dir = os.path.join(base_output_dir, video_name)
-    os.makedirs(video_dir, exist_ok=True)
-    
-    # Lista para armazenar todos os resultados
-    all_results = []
-    html_results = {}
-    
-    # Processa cada frame do vídeo
-    for frame_num in range(total_frames):
-        # Atualiza o progresso a cada 10 frames
-        if frame_num % 10 == 0:
-            print(f"\rProcessando frame {frame_num}/{total_frames} ({(frame_num/total_frames)*100:.1f}%)", end='')
-        
-        # Lê o frame
-        ret, frame = cap.read()
-        if not ret:
-            print(f"\nErro ao ler o frame {frame_num}")
-            continue
-        
-        # Cria diretório para o frame atual
-        frame_dir = os.path.join(video_dir, f"frame_{frame_num}")
-        os.makedirs(frame_dir, exist_ok=True)
-        
-        # Processa o frame
-        results, debug_info = process_frame(frame, frame_num, frame_dir, rois)
-        
-        # Armazena os resultados
-        frame_data = {
-            'frame_number': frame_num,
-            'frame_time': frame_num/fps,
-            'frame_percent': (frame_num/total_frames)*100,
-            'final_results': results
-        }
-        all_results.append(frame_data)
-        
-        # Armazena para o relatório HTML
-        html_results[frame_num] = {
-            'results': results,
-            'debug_info': debug_info
-        }
-    
-    print("\nProcessamento dos frames concluído!")
-    
-    # Gera o relatório HTML
-    html_content = generate_html_report(video_dir, html_results)
-    report_path = os.path.join(video_dir, f"{video_name}_relatorio.html")
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    
-    # Salva o arquivo CSV
-    csv_path = os.path.join(video_dir, f"{video_name}_resultados.csv")
-    with open(csv_path, "w", encoding="utf-8") as f:
-        # Escreve o cabeçalho
-        headers = ['Frame', 'Tempo (s)', 'Taxa de Aplicação (L/min)', 'Altura (m)', 'Espaçamento (m)', 'Velocidade (m/s)']
-        f.write(';'.join(headers) + '\n')
-        
-        # Escreve os dados de cada frame
-        for frame_data in all_results:
-            frame_num = frame_data['frame_number']
-            frame_time = frame_data['frame_time']
-            results = frame_data['final_results']
-            
-            row = [
-                str(frame_num),
-                f"{frame_time:.2f}".replace('.', ','),
-                str(results.get('spray_rate', {}).get('value', '')).replace('.', ',') if results.get('spray_rate', {}).get('value') is not None else '',
-                str(results.get('height', {}).get('value', '')).replace('.', ',') if results.get('height', {}).get('value') is not None else '',
-                str(results.get('spacing', {}).get('value', '')).replace('.', ',') if results.get('spacing', {}).get('value') is not None else '',
-                str(results.get('speed', {}).get('value', '')).replace('.', ',') if results.get('speed', {}).get('value') is not None else ''
-            ]
-            f.write(';'.join(row) + '\n')
-    
-    cap.release()
-    print(f"\nRelatório HTML gerado em: {report_path}")
-    print(f"Arquivo CSV gerado em: {csv_path}")
-    
-    # Salva o histórico do teste
-    history_file = save_test_history(all_results, time.strftime("%Y%m%d_%H%M%S"), video_path, rois)
-    print(f"Histórico do teste salvo em: {history_file}")
-    
-    return {
-        'video_name': video_name,
-        'report_path': report_path,
-        'csv_path': csv_path,
-        'total_frames': total_frames,
-        'processed_frames': len(all_results)
-    }
-
-def process_frame(frame, frame_num, debug_dir, rois):
+def process_frame(frame, frame_num, rois):
     """
     Processa um frame do vídeo usando as ROIs definidas pelo usuário
     """
     if not rois:
         print("Erro: Nenhuma ROI definida")
-        return {}, {}
-
-    frame_dir = os.path.join(debug_dir, f"frame_{frame_num}")
-    os.makedirs(frame_dir, exist_ok=True)
+        return {}
     
     results = {}
-    debug_info = {}
-    
     h, w = frame.shape[:2]
     
     # Processa cada ROI definida pelo usuário
@@ -639,19 +530,11 @@ def process_frame(frame, frame_num, debug_dir, rois):
         # Extrai a região da ROI
         roi_img = frame[y1:y2, x1:x2]
         
-        # Cria diretório para as imagens da ROI
-        roi_dir = os.path.join(frame_dir, roi_type)
-        os.makedirs(roi_dir, exist_ok=True)
-        
-        # Salva a imagem original da ROI
-        cv2.imwrite(os.path.join(roi_dir, "original.png"), roi_img)
-        
         # Processa com diferentes técnicas
         preprocessed_images = enhance_image_for_ocr(roi_img, roi_type)
         if not preprocessed_images:
             continue
         
-        debug_info[roi_type] = {}
         best_value = None
         best_confidence = 'low'
         
@@ -691,13 +574,6 @@ def process_frame(frame, frame_num, debug_dir, rois):
                         
                         confidence = 'high' if is_valid else 'low'
                         
-                        # Salva os resultados desta técnica
-                        debug_info[roi_type][technique] = {
-                            'value': value,
-                            'confidence': confidence,
-                            'image': processed_img
-                        }
-                        
                         # Atualiza o melhor resultado se necessário
                         if is_valid and (best_value is None or confidence == 'high'):
                             best_value = value
@@ -714,12 +590,90 @@ def process_frame(frame, frame_num, debug_dir, rois):
                 'value': best_value,
                 'confidence': best_confidence
             }
-            
-            # Print para debug do espaçamento
-            if roi_type == 'spacing':
-                print(f"\nEspaçamento detectado no frame {frame_num}: {best_value:.2f} (confiança: {best_confidence})")
     
-    return results, debug_info
+    return results
+
+def test_roi_extraction(video_path, rois):
+    """
+    Função principal de teste que processa o vídeo e extrai os valores das ROIs
+    """
+    # Abre o vídeo
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Erro ao abrir o vídeo: {video_path}")
+        return None
+    
+    # Obtém informações do vídeo
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    
+    print(f"\nProcessando vídeo: {video_name}")
+    print(f"FPS: {fps}")
+    print(f"Total de frames: {total_frames}")
+    print(f"Duração aproximada: {total_frames/fps:.2f} segundos")
+    
+    # Lista para armazenar todos os resultados
+    all_results = []
+    
+    # Calcula o intervalo de frames para 1 FPS
+    frame_interval = fps  # 1 frame por segundo
+    
+    # Processa cada frame do vídeo no intervalo definido
+    for frame_num in range(0, total_frames, frame_interval):
+        # Atualiza o progresso
+        percent = (frame_num/total_frames)*100
+        print(f"\rProcessando frame {frame_num}/{total_frames} ({percent:.1f}%) - {frame_num//fps}s", end='')
+        
+        # Lê o frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        ret, frame = cap.read()
+        if not ret:
+            print(f"\nErro ao ler o frame {frame_num}")
+            continue
+        
+        # Processa o frame
+        results = process_frame(frame, frame_num, rois)
+        
+        # Armazena os resultados
+        frame_data = {
+            'frame_number': frame_num,
+            'frame_time': frame_num/fps,
+            'frame_percent': (frame_num/total_frames)*100,
+            'final_results': results
+        }
+        all_results.append(frame_data)
+    
+    cap.release()
+    print("\nProcessamento dos frames concluído!")
+    
+    # Salva o arquivo CSV
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    csv_path = f"{video_name}_resultados_{timestamp}.csv"
+    
+    with open(csv_path, "w", encoding="utf-8") as f:
+        # Escreve o cabeçalho
+        headers = ['Frame', 'Tempo (s)', 'Taxa de Aplicação (L/min)', 'Altura (m)', 'Espaçamento (m)', 'Velocidade (m/s)']
+        f.write(';'.join(headers) + '\n')
+        
+        # Escreve os dados de cada frame
+        for frame_data in all_results:
+            frame_num = frame_data['frame_number']
+            frame_time = frame_data['frame_time']
+            results = frame_data['final_results']
+            
+            row = [
+                str(frame_num),
+                f"{frame_time:.2f}".replace('.', ','),
+                str(results.get('spray_rate', {}).get('value', '')).replace('.', ',') if results.get('spray_rate', {}).get('value') is not None else '',
+                str(results.get('height', {}).get('value', '')).replace('.', ',') if results.get('height', {}).get('value') is not None else '',
+                str(results.get('spacing', {}).get('value', '')).replace('.', ',') if results.get('spacing', {}).get('value') is not None else '',
+                str(results.get('speed', {}).get('value', '')).replace('.', ',') if results.get('speed', {}).get('value') is not None else ''
+            ]
+            f.write(';'.join(row) + '\n')
+    
+    print(f"\nArquivo CSV gerado: {csv_path}")
+    return csv_path
 
 def main():
     # Verifica se existem ROIs salvas
@@ -756,39 +710,14 @@ def main():
         print("Formatos suportados: .mp4, .avi, .mov, .mkv")
         return
     
-    # Cria diretório base para os resultados
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    base_output_dir = f"resultados_{timestamp}"
-    os.makedirs(base_output_dir, exist_ok=True)
-    
     print("\nROIs carregadas do arquivo last_rois.json:")
     for roi_type, roi_info in rois.items():
         print(f"{roi_type}: x={roi_info['x']:.3f}, y={roi_info['y']:.3f}, w={roi_info['width']:.3f}, h={roi_info['height']:.3f}")
     
     # Processa cada vídeo
-    results_summary = []
     for video_file in video_files:
         video_path = os.path.join(videos_dir, video_file)
-        result = test_roi_extraction(video_path, rois, base_output_dir)
-        if result:
-            results_summary.append(result)
-    
-    # Gera relatório final
-    summary_path = os.path.join(base_output_dir, "sumario_processamento.txt")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(f"Sumário do Processamento - {timestamp}\n")
-        f.write("="*50 + "\n\n")
-        
-        for result in results_summary:
-            f.write(f"Vídeo: {result['video_name']}\n")
-            f.write(f"Total de frames: {result['total_frames']}\n")
-            f.write(f"Frames processados: {result['processed_frames']}\n")
-            f.write(f"Relatório HTML: {os.path.basename(result['report_path'])}\n")
-            f.write(f"Arquivo CSV: {os.path.basename(result['csv_path'])}\n")
-            f.write("\n" + "-"*30 + "\n\n")
-    
-    print(f"\nProcessamento concluído! Resultados salvos em: {base_output_dir}")
-    print(f"Sumário do processamento: {summary_path}")
+        test_roi_extraction(video_path, rois)
 
 if __name__ == "__main__":
     main() 

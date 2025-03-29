@@ -151,13 +151,12 @@ class VideoProcessor(QThread):
         self.paused = False
         self.pause_condition = QWaitCondition()
         self.mutex = QMutex()
-        self.frames_per_second = 2  # Reduzido para 2 frames por segundo
+        self.frames_per_second = 1  # Reduzido para 1 frame por segundo
         self.correction_rules = []  # Lista de regras de correção
         
     def run(self):
         all_results = []
         total_videos = len(self.video_paths)
-        frame_count = 0
         
         for video_idx, video_path in enumerate(self.video_paths):
             if not self.running:
@@ -169,11 +168,16 @@ class VideoProcessor(QThread):
             
             # Obtém FPS do vídeo e calcula o intervalo de frames
             fps = int(cap.get(cv2.CAP_PROP_FPS))
-            frame_interval = max(1, fps // self.frames_per_second)
+            frame_interval = fps  # 1 frame por segundo
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            processed_count = 0
+            video_name = os.path.splitext(os.path.basename(video_path))[0]
             
-            while cap.isOpened() and self.running:
+            # Cria diretório para os resultados deste vídeo
+            video_dir = os.path.join("resultados_temp", video_name)
+            os.makedirs(video_dir, exist_ok=True)
+            
+            # Processa cada frame no intervalo definido
+            for frame_count in range(0, total_frames, frame_interval):
                 # Verifica se está pausado
                 self.mutex.lock()
                 if self.paused:
@@ -183,75 +187,164 @@ class VideoProcessor(QThread):
                 if not self.running:
                     break
                 
+                # Define a posição do frame
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count)
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
-                # Processa apenas frames no intervalo definido
-                if frame_count % frame_interval == 0:
-                    results = self.process_frame(frame)
-                    self.frame_processed.emit(frame, results, frame_count)
-                    
-                    if results:
-                        all_results.append(results)
-                    processed_count += 1
+                # Cria diretório para o frame atual
+                frame_dir = os.path.join(video_dir, f"frame_{frame_count}")
+                os.makedirs(frame_dir, exist_ok=True)
                 
-                frame_count += 1
+                # Processa o frame
+                results, debug_info = self.process_frame(frame, frame_count, frame_dir)
+                self.frame_processed.emit(frame, results, frame_count)
+                
+                if results:
+                    frame_data = {
+                        'Video': video_name,
+                        'Frame': frame_count,
+                        'Tempo (s)': frame_count / fps,
+                        'Taxa de Aplicação (L/min)': results.get('spray_rate', {}).get('value', None),
+                        'Altura (m)': results.get('height', {}).get('value', None),
+                        'Espaçamento (m)': results.get('spacing', {}).get('value', None),
+                        'Velocidade (m/s)': results.get('speed', {}).get('value', None)
+                    }
+                    all_results.append(frame_data)
+                
+                # Calcula o progresso
                 progress = (frame_count * 100) // total_frames
                 video_progress = ((video_idx * 100) + progress) // total_videos
                 
                 self.progress_updated.emit(
                     video_progress,
-                    f"Processando vídeo {video_idx + 1}/{total_videos} - Frame {frame_count}/{total_frames}"
+                    f"Processando vídeo {video_idx + 1}/{total_videos} - Frame {frame_count}/{total_frames} - {frame_count//fps}s"
                 )
             
             cap.release()
         
         if all_results:
             df = pd.DataFrame(all_results)
-            df.columns = ['Taxa de Aplicação (L/min)', 'Altura (m)', 
-                         'Espaçamento (m)', 'Velocidade (m/s)']
-            
             # Remove outliers e valores impossíveis
             df = self.clean_results(df)
-            
             self.processing_finished.emit(df)
     
-    def apply_corrections(self, roi_type, value):
-        if value is None:
-            return None
-            
-        # Aplica a primeira regra que corresponde ao valor
-        for rule in self.correction_rules:
-            if rule.roi_type == roi_type and rule.applies_to(value):
-                return rule.corrected_value
+    def process_frame(self, frame, frame_num, debug_dir):
+        """
+        Processa um frame do vídeo usando as ROIs definidas pelo usuário
+        """
+        if not self.rois:
+            return {}, {}
+
+        results = {}
+        debug_info = {}
         
-        return value
-    
-    def process_frame(self, frame):
         h, w = frame.shape[:2]
-        values = {}
         
-        for name, roi in self.rois.items():
-            if not roi:
+        # Processa cada ROI definida pelo usuário
+        for roi_type, roi_info in self.rois.items():
+            if not roi_info:  # Pula se a ROI não foi definida
                 continue
                 
-            x1 = int(w * roi['x'])
-            y1 = int(h * roi['y'])
-            x2 = int(w * (roi['x'] + roi['width']))
-            y2 = int(h * (roi['y'] + roi['height']))
+            # Calcula as coordenadas da ROI usando as definidas pelo usuário
+            x1 = int(w * roi_info['x'])
+            y1 = int(h * roi_info['y'])
+            x2 = int(w * (roi_info['x'] + roi_info['width']))
+            y2 = int(h * (roi_info['y'] + roi_info['height']))
             
+            # Extrai a região da ROI
             roi_img = frame[y1:y2, x1:x2]
-            value = self.extract_value(roi_img, name)
             
-            # Aplica as regras de correção
-            value = self.apply_corrections(name, value)
+            # Cria diretório para as imagens da ROI
+            roi_dir = os.path.join(debug_dir, roi_type)
+            os.makedirs(roi_dir, exist_ok=True)
             
-            values[name] = value
+            # Salva a imagem original da ROI
+            cv2.imwrite(os.path.join(roi_dir, "original.png"), roi_img)
             
-        return values
+            # Processa com diferentes técnicas
+            preprocessed_images = self.enhance_image_for_ocr(roi_img, roi_type)
+            if not preprocessed_images:
+                continue
+            
+            debug_info[roi_type] = {}
+            best_value = None
+            best_confidence = 'low'
+            
+            for technique, processed_img in preprocessed_images:
+                try:
+                    # Configuração do OCR apenas para dígitos e ponto
+                    config = '--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789.'
+                    
+                    # Extrai o texto
+                    text = pytesseract.image_to_string(processed_img, config=config).strip()
+                    text = ''.join(c for c in text if c.isdigit() or c == '.')
+                    
+                    if text:
+                        try:
+                            value = float(text)
+                            
+                            # Ajusta valores para o espaçamento
+                            if roi_type == 'spacing':
+                                # Se o valor for maior que 5, assume que é um decimal sem ponto
+                                if value > 5:
+                                    value = value / 10
+                                # Validação mais flexível para espaçamento
+                                is_valid = 0.1 <= value <= 5
+                            else:
+                                # Para outros tipos, mantém a lógica original
+                                if '.' not in text:
+                                    if roi_type == 'height':
+                                        # Para altura, se o valor for maior que 20, divide por 10
+                                        if value > 20:
+                                            value = value / 10
+                                    elif value >= 100:
+                                        value = value / 100
+                                    elif value >= 10:
+                                        value = value / 10
+                                
+                                # Validações específicas por tipo
+                                is_valid = False
+                                if roi_type == 'spray_rate' and 0.1 <= value <= 10:
+                                    is_valid = True
+                                elif roi_type == 'height' and 0.1 <= value <= 20:
+                                    is_valid = True
+                                elif roi_type == 'speed' and 0.1 <= value <= 20:
+                                    is_valid = True
+                            
+                            confidence = 'high' if is_valid else 'low'
+                            
+                            # Salva os resultados desta técnica
+                            debug_info[roi_type][technique] = {
+                                'value': value,
+                                'confidence': confidence,
+                                'image': processed_img
+                            }
+                            
+                            # Atualiza o melhor resultado se necessário
+                            if is_valid and (best_value is None or confidence == 'high'):
+                                best_value = value
+                                best_confidence = confidence
+                        
+                        except ValueError:
+                            continue
+                
+                except Exception as e:
+                    continue
+            
+            if best_value is not None:
+                results[roi_type] = {
+                    'value': best_value,
+                    'confidence': best_confidence
+                }
+        
+        return results, debug_info
     
-    def extract_value(self, image, roi_type):
+    def enhance_image_for_ocr(self, image, roi_type):
+        """
+        Função otimizada para pré-processamento de imagem usando vários métodos
+        """
         if image is None or image.size == 0:
             return None
 
@@ -259,74 +352,58 @@ class VideoProcessor(QThread):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
         # Aumenta significativamente o fator de escala
-        scale = 7 if roi_type in ['speed', 'spacing'] else 6
+        scale = 8 if roi_type in ['spacing', 'height'] else 7 if roi_type == 'speed' else 6
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         
-        results = []
-        
-        # Aplica vários métodos de pré-processamento
         preprocessed_images = []
         
-        # 1. Normalização básica com threshold adaptativo
-        norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-        adaptive1 = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 2)
-        preprocessed_images.append(adaptive1)
-        
-        # 2. Threshold Otsu com blur
-        blur = cv2.GaussianBlur(gray, (3,3), 0)
-        _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        preprocessed_images.append(otsu)
-        
-        # 3. Threshold adaptativo direto
-        adaptive2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 21, 2)
-        preprocessed_images.append(adaptive2)
-        
-        # 4. Normalização com equalização de histograma
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        cl1 = clahe.apply(gray)
-        _, thresh_eq = cv2.threshold(cl1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        preprocessed_images.append(thresh_eq)
-        
-        for processed_img in preprocessed_images:
-            # Configurações específicas do OCR para melhor reconhecimento de números
-            custom_config = r'--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789. -c tessedit_char_blacklist=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ -c tessedit_write_images=false'
+        # Para altura e espaçamento, aplica técnicas específicas
+        if roi_type in ['spacing', 'height']:
+            # 1. Threshold adaptativo com kernel maior
+            norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+            adaptive1 = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5)
+            preprocessed_images.append(("Adaptativo Gaussiano", adaptive1))
             
-            try:
-                # Extrai o texto com maior precisão
-                text = pytesseract.image_to_string(processed_img, config=custom_config).strip()
-                text = ''.join(c for c in text if c.isdigit() or c == '.')
-                
-                if text and text.count('.') <= 1:
-                    try:
-                        value = float(text)
-                        
-                        # Se não tem ponto decimal e o número é grande, tenta interpretar como decimal
-                        if '.' not in text:
-                            if value >= 100:
-                                value = value / 100
-                            elif value >= 10:
-                                value = value / 10
-                        
-                        # Validação específica por tipo de ROI
-                        if roi_type == 'speed' and 0.1 <= value <= 10:
-                            results.append(value)
-                        elif roi_type in ['height', 'spacing'] and 0.1 <= value <= 5:
-                            results.append(value)
-                        elif roi_type == 'spray_rate' and 0.1 <= value <= 10:
-                            results.append(value)
-                    except ValueError:
-                        continue
-            except Exception:
-                continue
-
-        # Se tiver resultados, retorna a mediana para maior precisão
-        if results:
-            # Remove outliers antes de calcular a mediana
-            if len(results) > 2:
-                results.sort()
-                results = results[1:-1]  # Remove o menor e o maior valor
-            return np.median(results)
-        return None
+            # 2. Threshold Otsu com blur mais forte
+            blur = cv2.GaussianBlur(gray, (5,5), 0)
+            _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            preprocessed_images.append(("Otsu", otsu))
+            
+            # 3. CLAHE com parâmetros ajustados
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))
+            cl1 = clahe.apply(gray)
+            _, thresh_eq = cv2.threshold(cl1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            preprocessed_images.append(("CLAHE", thresh_eq))
+            
+            # 4. Dilatação seguida de erosão para melhorar a conectividade dos dígitos
+            kernel = np.ones((2,2), np.uint8)
+            dilated = cv2.dilate(gray, kernel, iterations=1)
+            eroded = cv2.erode(dilated, kernel, iterations=1)
+            _, morph = cv2.threshold(eroded, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            preprocessed_images.append(("Morfológico", morph))
+        else:
+            # Para outros tipos de ROI, mantém o processamento original
+            # 1. Normalização básica com threshold adaptativo
+            norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+            adaptive1 = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 2)
+            preprocessed_images.append(("Adaptativo Gaussiano", adaptive1))
+            
+            # 2. Threshold Otsu com blur
+            blur = cv2.GaussianBlur(gray, (3,3), 0)
+            _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            preprocessed_images.append(("Otsu", otsu))
+            
+            # 3. Threshold adaptativo direto
+            adaptive2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 21, 2)
+            preprocessed_images.append(("Adaptativo Médio", adaptive2))
+            
+            # 4. CLAHE
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            cl1 = clahe.apply(gray)
+            _, thresh_eq = cv2.threshold(cl1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            preprocessed_images.append(("CLAHE", thresh_eq))
+        
+        return preprocessed_images
     
     def clean_results(self, df):
         """Remove outliers e valores impossíveis do DataFrame"""
@@ -621,6 +698,7 @@ class MainWindow(QMainWindow):
         self.processor = None
         self.correction_rules = []
         self.paused = False
+        self.is_roi_active = False  # Nova flag para controle de estado do ROI
         
         # Widgets que precisam ser acessados globalmente
         self.video_view = None
@@ -998,29 +1076,35 @@ class MainWindow(QMainWindow):
         # Desenha as ROIs existentes e a seleção atual
         frame_with_rois = frame.copy()
         
+        # Desenha as ROIs existentes com cores diferentes e labels
+        for roi_id, roi_info in self.rois.items():
+            if roi_info:  # Verifica se a ROI existe
+                color = self.roi_selector.rois[roi_id]['color'].getRgb()[:3]
+                color = (color[2], color[1], color[0])  # Converte BGR para RGB
+                
+                # Calcula as coordenadas da ROI
+                x1 = int(w * roi_info['x'])
+                y1 = int(h * roi_info['y'])
+                x2 = int(w * (roi_info['x'] + roi_info['width']))
+                y2 = int(h * (roi_info['y'] + roi_info['height']))
+                
+                # Desenha o retângulo da ROI
+                cv2.rectangle(frame_with_rois, (x1, y1), (x2, y2), color, 2)
+                
+                # Adiciona label com o nome da ROI
+                label = self.roi_selector.rois[roi_id]['name']
+                cv2.putText(frame_with_rois, label, (x1, y1-5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
         # Desenha a seleção atual com linha fina
         if draw_selection and self.drawing and self.start_point and self.end_point:
             if self.roi_selector.current_roi:
                 color = self.roi_selector.rois[self.roi_selector.current_roi]['color'].getRgb()[:3]
                 color = (color[2], color[1], color[0])  # Converte BGR para RGB
-                # Desenha o retângulo com linha fina (1 pixel)
                 cv2.rectangle(frame_with_rois, 
                             self.start_point,
                             self.end_point,
                             color, 1)
-        
-        # Desenha as ROIs existentes
-        for roi_id, roi_info in self.rois.items():
-            if roi_info and 'roi' in roi_info and roi_info['roi'] is not None:
-                roi = roi_info['roi']
-                color = self.roi_selector.rois[roi_id]['color'].getRgb()[:3]
-                color = (color[2], color[1], color[0])  # Converte BGR para RGB
-                x1 = int(w * roi['x'])
-                y1 = int(h * roi['y'])
-                x2 = int(w * (roi['x'] + roi['width']))
-                y2 = int(h * (roi['y'] + roi['height']))
-                # Desenha o retângulo com linha fina (1 pixel)
-                cv2.rectangle(frame_with_rois, (x1, y1), (x2, y2), color, 1)
         
         # Redimensiona o frame com o zoom atual
         frame_with_rois = cv2.resize(frame_with_rois, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
@@ -1038,110 +1122,86 @@ class MainWindow(QMainWindow):
     
     def mousePressEvent(self, event):
         try:
-            if not self.roi_selector or not self.roi_selector.current_roi:
-                return
-                
-            # Converte as coordenadas globais para coordenadas locais do video_view
-            if not hasattr(self, 'video_view'):
+            if not self.roi_selector or not self.roi_selector.current_roi or not self.is_roi_active:
                 return
                 
             pos = self.video_view.mapFrom(self, event.pos())
             if not self.video_view.rect().contains(pos):
                 return
                 
-            # Converte as coordenadas para o frame original
             frame_pos = self.view_to_frame_coords(pos)
             if frame_pos:
                 self.drawing = True
                 self.start_point = frame_pos
                 self.end_point = frame_pos
                 
-                # Força a atualização do frame para mostrar o início do traçado
                 if hasattr(self, 'current_frame') and self.current_frame is not None:
                     self.show_frame(self.current_frame.copy())
         except Exception as e:
             print(f"Erro no mousePressEvent: {e}")
-    
-    def mouseMoveEvent(self, event):
-        try:
-            if not hasattr(self, 'video_view') or not hasattr(self, 'drawing') or not self.drawing:
-                return
-                
-            # Converte as coordenadas globais para coordenadas locais do video_view
-            pos = self.video_view.mapFrom(self, event.pos())
-            
-            # Continua com o desenho da ROI se estiver em modo de desenho
-            if self.drawing and self.video_view.rect().contains(pos):
-                # Converte as coordenadas para o frame original
-                frame_pos = self.view_to_frame_coords(pos)
-                if frame_pos:
-                    self.end_point = frame_pos
-                    # Força a atualização do frame para mostrar o traçado em tempo real
-                    if hasattr(self, 'current_frame') and self.current_frame is not None:
-                        self.show_frame(self.current_frame.copy())
-                        
-                        # Atualiza o preview em tempo real
-                        if self.roi_selector and self.roi_selector.current_roi and hasattr(self, 'start_point'):
-                            w, h = self.frame_dims
-                            x1, y1 = self.start_point
-                            x2, y2 = self.end_point
-                            temp_roi = {
-                                'x': min(x1, x2) / w,
-                                'y': min(y1, y2) / h,
-                                'width': abs(x2 - x1) / w,
-                                'height': abs(y2 - y1) / h
-                            }
-                            self.roi_selector.update_preview(self.current_frame, temp_roi)
-        except Exception as e:
-            print(f"Erro no mouseMoveEvent: {e}")
-    
+            self.reset_roi_state()
+
     def mouseReleaseEvent(self, event):
         try:
-            if not hasattr(self, 'drawing') or not self.drawing:
+            if not self.drawing:
                 return
                 
             self.drawing = False
             
-            if not hasattr(self, 'video_view'):
-                return
-                
-            # Converte as coordenadas globais para coordenadas locais do video_view
             pos = self.video_view.mapFrom(self, event.pos())
             if not self.video_view.rect().contains(pos):
+                self.reset_roi_state()
                 return
                 
-            # Converte as coordenadas para o frame original
             frame_pos = self.view_to_frame_coords(pos)
-            if frame_pos and hasattr(self, 'start_point') and self.start_point and self.roi_selector and self.roi_selector.current_roi:
+            if frame_pos and self.start_point and self.roi_selector and self.roi_selector.current_roi:
                 self.end_point = frame_pos
                 
-                # Normaliza as coordenadas
-                if hasattr(self, 'frame_dims'):
-                    w, h = self.frame_dims
-                    x1, y1 = self.start_point
-                    x2, y2 = self.end_point
-                    
-                    roi = {
-                        'x': min(x1, x2) / w,
-                        'y': min(y1, y2) / h,
-                        'width': abs(x2 - x1) / w,
-                        'height': abs(y2 - y1) / h
-                    }
-                    
-                    if hasattr(self, 'rois'):
-                        self.rois[self.roi_selector.current_roi] = roi
-                        self.roi_selector.rois[self.roi_selector.current_roi]['roi'] = roi
-                        self.roi_selector.update_status()
-                        self.roi_selector.save_last_rois()
-                        
-                        # Força a atualização final do frame
-                        if hasattr(self, 'current_frame') and self.current_frame is not None:
-                            self.show_frame(self.current_frame.copy())
-                            # Atualiza o preview com a nova ROI
-                            self.roi_selector.update_preview(self.current_frame, roi)
+                w, h = self.frame_dims
+                x1, y1 = self.start_point
+                x2, y2 = self.end_point
+                
+                roi = {
+                    'x': min(x1, x2) / w,
+                    'y': min(y1, y2) / h,
+                    'width': abs(x2 - x1) / w,
+                    'height': abs(y2 - y1) / h
+                }
+                
+                self.rois[self.roi_selector.current_roi] = roi
+                self.roi_selector.rois[self.roi_selector.current_roi]['roi'] = roi
+                self.roi_selector.update_status()
+                self.roi_selector.save_last_rois()
+                
+                if self.current_frame is not None:
+                    self.show_frame(self.current_frame.copy())
+                    self.roi_selector.update_preview(self.current_frame, roi)
+            
+            self.reset_roi_state()
         except Exception as e:
             print(f"Erro no mouseReleaseEvent: {e}")
-    
+            self.reset_roi_state()
+
+    def reset_roi_state(self):
+        """Reseta o estado do ROI para evitar travamentos"""
+        self.drawing = False
+        self.start_point = None
+        self.end_point = None
+        self.is_roi_active = False
+        if self.current_frame is not None:
+            self.show_frame(self.current_frame.copy())
+
+    def on_roi_selected(self, roi_id, roi):
+        """Atualizado para melhor gerenciamento de estado"""
+        self.is_roi_active = True
+        self.rois[roi_id] = roi
+        self.statusBar().showMessage(f'ROI {roi_id} selecionada. Clique e arraste para definir a área.')
+        
+        # Reset do estado ao selecionar nova ROI
+        self.drawing = False
+        self.start_point = None
+        self.end_point = None
+
     def view_to_frame_coords(self, pos):
         """Converte coordenadas da view para coordenadas do frame considerando o zoom"""
         try:
@@ -1188,10 +1248,6 @@ class MainWindow(QMainWindow):
             event.accept()
         else:
             super().wheelEvent(event)
-    
-    def on_roi_selected(self, roi_id, roi):
-        self.rois[roi_id] = roi
-        self.statusBar().showMessage(f'ROI {roi_id} selecionada')
     
     def load_rois(self):
         filename, _ = QFileDialog.getOpenFileName(
@@ -1293,16 +1349,24 @@ class MainWindow(QMainWindow):
             }
             
             # Preenche a linha com os valores do frame atual
-            for roi_name, value in results.items():
+            for roi_name, value_info in results.items():
                 column = column_mapping.get(roi_name)
                 if column is not None:
+                    value = value_info.get('value')
+                    confidence = value_info.get('confidence', 'low')
+                    
                     item = QTableWidgetItem(f"{value:.2f}" if value is not None else "--")
                     item.setTextAlignment(Qt.AlignCenter)
-                    # Define cor de fundo baseada na validade do valor
+                    
+                    # Define cor de fundo baseada na confiança
                     if value is not None:
-                        item.setBackground(QColor(200, 255, 200))  # Verde claro para valores válidos
+                        if confidence == 'high':
+                            item.setBackground(QColor(200, 255, 200))  # Verde claro para alta confiança
+                        else:
+                            item.setBackground(QColor(255, 255, 200))  # Amarelo claro para baixa confiança
                     else:
                         item.setBackground(QColor(255, 200, 200))  # Vermelho claro para valores não reconhecidos
+                    
                     self.data_table.setItem(row_position, column, item)
             
             # Rola a tabela para a última linha
@@ -1326,14 +1390,37 @@ class MainWindow(QMainWindow):
             )
             
             if filename:
+                # Salva o DataFrame com as configurações adequadas
                 df.to_csv(filename, 
                          index=False,
-                         encoding='utf-8-sig',
-                         sep=';',
-                         decimal=',',
-                         float_format='%.2f')
+                         encoding='utf-8-sig',  # Para suportar caracteres especiais
+                         sep=';',               # Separador ponto e vírgula
+                         decimal=',',           # Usa vírgula como separador decimal
+                         float_format='%.2f')   # Formata números com 2 casas decimais
                 
-                self.statusBar().showMessage('Processamento concluído! Resultados salvos.')
+                # Salva também um arquivo de log com informações detalhadas
+                log_filename = filename.replace('.csv', '_log.txt')
+                with open(log_filename, 'w', encoding='utf-8') as f:
+                    f.write("Log de Processamento\n")
+                    f.write("===================\n\n")
+                    f.write(f"Total de frames processados: {len(df)}\n")
+                    f.write(f"Total de vídeos processados: {len(df['Video'].unique())}\n\n")
+                    
+                    # Estatísticas por tipo de ROI
+                    for col in ['Taxa de Aplicação (L/min)', 'Altura (m)', 'Espaçamento (m)', 'Velocidade (m/s)']:
+                        if col in df.columns:
+                            values = df[col].dropna()
+                            if not values.empty:
+                                f.write(f"\nEstatísticas para {col}:\n")
+                                f.write(f"  - Média: {values.mean():.2f}\n")
+                                f.write(f"  - Mediana: {values.median():.2f}\n")
+                                f.write(f"  - Desvio Padrão: {values.std():.2f}\n")
+                                f.write(f"  - Mínimo: {values.min():.2f}\n")
+                                f.write(f"  - Máximo: {values.max():.2f}\n")
+                                f.write(f"  - Total de valores válidos: {len(values)}\n")
+                                f.write(f"  - Taxa de sucesso: {(len(values) / len(df) * 100):.1f}%\n")
+                
+                self.statusBar().showMessage(f'Processamento concluído! Resultados salvos em {filename} e {log_filename}')
         else:
             self.statusBar().showMessage('Processamento concluído sem resultados.')
     
@@ -1386,6 +1473,36 @@ class MainWindow(QMainWindow):
         
         if self.current_frame is not None:
             self.show_frame(self.current_frame)
+
+    def mouseMoveEvent(self, event):
+        try:
+            if not self.drawing or not self.is_roi_active:
+                return
+                
+            pos = self.video_view.mapFrom(self, event.pos())
+            if not self.video_view.rect().contains(pos):
+                return
+                
+            frame_pos = self.view_to_frame_coords(pos)
+            if frame_pos and self.current_frame is not None:
+                self.end_point = frame_pos
+                self.show_frame(self.current_frame.copy())
+                
+                # Atualiza o preview em tempo real
+                if self.roi_selector and self.roi_selector.current_roi and self.start_point:
+                    w, h = self.frame_dims
+                    x1, y1 = self.start_point
+                    x2, y2 = self.end_point
+                    temp_roi = {
+                        'x': min(x1, x2) / w,
+                        'y': min(y1, y2) / h,
+                        'width': abs(x2 - x1) / w,
+                        'height': abs(y2 - y1) / h
+                    }
+                    self.roi_selector.update_preview(self.current_frame, temp_roi)
+        except Exception as e:
+            print(f"Erro no mouseMoveEvent: {e}")
+            self.reset_roi_state()
 
 def main():
     # Verifica se o Tesseract está instalado
