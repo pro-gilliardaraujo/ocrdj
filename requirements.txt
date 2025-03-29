@@ -1,0 +1,5 @@
+opencv-python>=4.8.0
+pytesseract>=0.3.10
+pandas>=2.1.0
+numpy>=1.26.0
+PyQt5>=5.15.0 
